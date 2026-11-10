@@ -108,9 +108,10 @@ namespace super_planner {
 
             seed_lines.emplace_back(path[first_id], path[second_id]);
             if ((path[first_id] - path[second_id]).norm() > seed_line_max_length_ * 1.5) {
-                fmt::print("first: {}\n second: {}\n seed line max: {}\n", path[first_id].transpose(),
-                           path[second_id].transpose(), seed_line_max_length_);
-                throw std::runtime_error("seed line too long");
+                // [px4_oa] fail this plan instead of throwing: the throw killed fsm_node mid-flight
+                // (SITL cruise_12m), and the next replan usually finds a denser path
+                ros_ptr_->warn(" -- [SUPER] seed line too long ({} m, max {}), force return.",
+                               (path[first_id] - path[second_id]).norm(), seed_line_max_length_);
                 return false;
             }
             if (!GeneratePolytopeFromLine(seed_lines.back(), temp_poly)) {
