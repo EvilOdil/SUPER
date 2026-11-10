@@ -22,6 +22,7 @@
 */
 
 #include <rog_map/prob_map.h>
+#include "rog_map/rog_map_core/profiling.h"
 using namespace rog_map;
 using namespace super_utils;
 
@@ -306,6 +307,7 @@ void ProbMap::slideAllMap(const rog_map::Vec3f& pos) {
 }
 
 void ProbMap::updateProbMap(const PointCloud& cloud, const Pose& pose) {
+    ROGMAP_RANGE("rogmap/update");
     TimeConsuming tc("updateMap", false);
     const Vec3f& pos = pose.first;
     time_consuming_[4] = cloud.size();
@@ -336,14 +338,20 @@ void ProbMap::updateProbMap(const PointCloud& cloud, const Pose& pose) {
 
     updateLocalBox(pos);
     TimeConsuming t_raycast("raycast", false);
-    raycastProcess(cloud, pos);
+    {
+        ROGMAP_RANGE("rogmap/raycast");
+        raycastProcess(cloud, pos);
+    }
     time_consuming_[1] = t_raycast.stop();
     raycast_data_.batch_update_counter++;
     if (raycast_data_.batch_update_counter >= cfg_.batch_update_size) {
         raycast_data_.batch_update_counter = 0;
         time_consuming_[5] = raycast_data_.update_cache_id_g.size();
         TimeConsuming t_update("update", false);
-        probabilisticMapFromCache();
+        {
+            ROGMAP_RANGE("rogmap/write_cells");
+            probabilisticMapFromCache();
+        }
         time_consuming_[2] = t_update.stop();
         map_empty_ = false;
     }

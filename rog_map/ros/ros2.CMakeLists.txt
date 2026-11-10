@@ -78,6 +78,20 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
 )
 
 
+# [px4_oa] Nsight Systems ranges (NVTX is header-only and ships with the CUDA toolkit)
+find_path(NVTX_INCLUDE_DIR nvtx3/nvToolsExt.h PATHS /usr/local/cuda/include)
+if (NVTX_INCLUDE_DIR)
+    message(STATUS "rog_map: NVTX ranges on (${NVTX_INCLUDE_DIR})")
+    target_compile_definitions(${PROJECT_NAME} PUBLIC ROGMAP_NVTX)
+    target_include_directories(${PROJECT_NAME} PUBLIC ${NVTX_INCLUDE_DIR})
+    target_link_libraries(${PROJECT_NAME} PUBLIC ${CMAKE_DL_LIBS})
+endif ()
+
+# [px4_oa] replay benchmark, see docs/cuda_rogmap_plan.md
+add_executable(rogmap_bench apps/rogmap_bench.cpp)
+target_link_libraries(rogmap_bench rog_map)
+install(TARGETS rogmap_bench RUNTIME DESTINATION lib/${PROJECT_NAME})
+
 install(TARGETS
         ${PROJECT_NAME}
         ARCHIVE DESTINATION lib
