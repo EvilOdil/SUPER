@@ -186,6 +186,9 @@ namespace fsm {
 
         typedef std::shared_ptr<FsmRos2> Ptr;
 
+        // [px4_oa] the planner's map, for /oa/map_query (fsm_node_ros2.cpp)
+        const rog_map::ROGMapROS::Ptr &getMap() const { return map_ptr_; }
+
         void saveReplanLogToFile(const string &name = "") {
             // run statistic
             double total_length{0.0};
