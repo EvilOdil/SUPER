@@ -281,6 +281,24 @@ namespace fsm {
             super_utils::Vec3f goal_p = Vec3f{msg->pose.position.x, msg->pose.position.y, msg->pose.position.z};
             super_utils::Quatf goal_q = super_utils::Quatf{msg->pose.orientation.w, msg->pose.orientation.x,
                                                            msg->pose.orientation.y, msg->pose.orientation.z};
+            // [px4_oa] Plan the new goal from the vehicle, not from a stale trajectory. FOLLOW_TRAJ
+            // never ends by itself, so after a detour SUPER keeps its old trajectory while another
+            // mode (PX4 Mission) flies the vehicle on; a new goal then went to ReplanOnce, which
+            // replans from that trajectory's state metres behind the vehicle: it failed or its
+            // commands started far from the vehicle (Mission OA's follower won't fly those), and
+            // the next detour sat still (SITL: 15 s, 24.5 m from the goal, then Hold).
+            if (machine_state_ == FOLLOW_TRAJ) {
+                StatePVAJ pvaj;
+                double yaw, yaw_dot;
+                bool on_backup, finished;
+                planner_ptr_->getOneCommandFromTraj(pvaj, yaw, yaw_dot, on_backup, finished);
+                planner_ptr_->getRobotState(robot_state_);
+                const double dev = (pvaj.col(0) - robot_state_.p).norm();
+                if (dev > 1.0) {
+                    ros_ptr_->warn(" -- [Fsm] New goal {:.1f} m off the trajectory: planning from the vehicle.", dev);
+                    ChangeState("goalCallback", GENERATE_TRAJ);
+                }
+            }
             setGoalPosiAndYaw(goal_p, goal_q);
         }
 
