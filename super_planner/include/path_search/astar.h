@@ -152,7 +152,7 @@ namespace path_search {
                                         const int &flag,
                                         const double &searching_horizon,
                                         rog_map::vec_Vec3f &out_path,
-                                        const double &time_out = 0.1);
+                                        const double &time_out_arg = -1.0);  // <= 0: astar/time_out
 
         /// @ brief: The escape path only for path search from prob map to inf map. from non-occupied point to
         ///          inf map free (or known freee) point . Aim to find a path from current point to (known) free point

@@ -232,7 +232,8 @@ namespace path_search {
 
     RET_CODE Astar::pointToPointPathSearch(const rog_map::Vec3f &start_pt, const rog_map::Vec3f &end_pt,
                                            const int &flag, const double &searching_horizon,
-                                           rog_map::vec_Vec3f &out_path, const double &time_out) {
+                                           rog_map::vec_Vec3f &out_path, const double &time_out_arg) {
+        const double time_out = time_out_arg > 0 ? time_out_arg : cfg_.time_out;
         RET_CODE setup_ret = setup(start_pt, end_pt, flag, searching_horizon);
         if (setup_ret != SUCCESS) {
             return setup_ret;
