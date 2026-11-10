@@ -23,10 +23,13 @@
 
 #include <super_core/corridor_generator.h>
 #include <array>
+#include <stdexcept>
 
 using namespace super_utils;
 
 namespace super_planner {
+
+    static bool seedClearFractionOk();  // [px4_oa] defined with seedClearFraction below
 
     CorridorGenerator::CorridorGenerator(const ros_interface::RosInterface::Ptr &ros_ptr,
                                          const rog_map::ROGMapROS::Ptr &map_ptr, const double bound_dis,
@@ -41,6 +44,9 @@ namespace super_planner {
         min_overlap_threshold_ = min_overlap_threshold;
         robot_r_ = robot_r;
         map_res_ = map_ptr_->getMapConfig().resolution;
+        if (!seedClearFractionOk()) {
+            throw std::runtime_error("corridor_generator: seedClearFraction self-check failed");
+        }
         box_search_skip_num_ = box_search_skip_num;
         iris_iter_num_ = iris_iter_num;
         virtual_ceil_height_ = virtual_ceil_height - robot_r;
@@ -378,6 +384,40 @@ namespace super_planner {
 
     }
 
+    // [px4_oa] Fraction of the segment s->e that stays r away from every point of pc (each at
+    // least r from s). 1 = the whole segment; 0 = e must fall back to s.
+    static double seedClearFraction(const Vec3f &s, const Vec3f &e, const vec_E<Vec3f> &pc, const double r) {
+        const Vec3f d = e - s;
+        const double dd = d.squaredNorm();
+        double t_max = 1.0;
+        if (dd < 1e-12) {
+            return t_max;
+        }
+        for (const auto &p : pc) {
+            const Vec3f w = p - s;
+            const double b = d.dot(w);
+            if (b <= 0) {
+                continue;  // the segment moves away from p
+            }
+            const double disc = b * b - dd * (w.squaredNorm() - r * r);
+            if (disc < 0) {
+                continue;  // the line never comes within r of p
+            }
+            t_max = std::min(t_max, std::max(0.0, (b - std::sqrt(disc)) / dd));  // first touch
+        }
+        return t_max;
+    }
+
+    // Start-up check of seedClearFraction (asserts are compiled out in this Release build).
+    static bool seedClearFractionOk() {
+        const Vec3f s(0, 0, 0), e(4, 0, 0);
+        const double far = seedClearFraction(s, e, {Vec3f(2, 3, 0)}, 0.8);     // 3 m to the side
+        const double hit = seedClearFraction(s, e, {Vec3f(2, 0, 0)}, 0.8);     // on the line: stop 0.8 m short
+        const double back = seedClearFraction(s, e, {Vec3f(-1, 0, 0)}, 0.8);   // behind the start
+        const double graze = seedClearFraction(s, e, {Vec3f(0.8, 0, 0)}, 0.8); // already touching
+        return far == 1.0 && std::abs(hit - 0.3) < 1e-9 && back == 1.0 && graze < 1e-9;
+    }
+
     void CorridorGenerator::collectSeenBoundary(const Vec3f &box_min, const Vec3f &box_max,
                                                 vec_E<Vec3f> &out) const {
         // The surface of unseen space: unknown cells next to a seen-free cell, one point per
@@ -428,10 +468,13 @@ namespace super_planner {
             return id < 13 ? id : id - 1;
         };
         pc.reserve(occ.size() + unseen.size());
+        seen_stats = SeenStats{};
         for (const auto *set : {&occ, &unseen}) {
+            double &nearest = set == &occ ? seen_stats.nearest_occ : seen_stats.nearest_unseen;
             for (const auto &p : *set) {
                 const Vec3f d = p - s;
                 const double n = d.norm();
+                nearest = nearest < 0 ? n : std::min(nearest, n);
                 if (n >= robot_r_) {
                     pc.push_back(p);
                 } else if (n > 1e-6) {
@@ -441,6 +484,19 @@ namespace super_planner {
                 }
             }
         }
+
+        // CIRI refuses a seed line that passes within robot_r of a point. The exp traj may graze
+        // unseen space, so keep only the part of the seed that is clear (1 cm spare); what is
+        // left can be the vehicle alone, which is clear by the split above. Retrying shorter
+        // seeds blindly (as before) froze the vehicle 0.8-1.5 m from foliage: the last retry was
+        // not at the vehicle, and every retry cost a full corridor build.
+        const double seed_len = (line.second - s).norm();
+        const double clear_len = seedClearFraction(s, line.second, pc, robot_r_) * seed_len - 0.01;
+        if (clear_len < seed_len - 0.01) {
+            line.second = clear_len > 0.1 ? Vec3f(s + (line.second - s) * (clear_len / seed_len)) : s;
+        }
+        seen_stats.seed_asked = seed_len;
+        seen_stats.seed_kept = (line.second - s).norm();
 
         MatD4f planes;
         if (pc.empty()) {
@@ -479,6 +535,7 @@ namespace super_planner {
         for (bool u : near_used) {
             n_near += u;
         }
+        seen_stats.ciri_faces = static_cast<int>(planes.rows());
         MatD4f all(planes.rows() + n_near, 4);
         all.topRows(planes.rows()) = planes;
         int r = static_cast<int>(planes.rows());

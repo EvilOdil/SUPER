@@ -945,21 +945,14 @@ namespace super_planner {
 
         Polytope temp_poly;
         if (cfg_.backup_in_seen_space) {
-            // [px4_oa] Corridor in seen-free space. If the seed line grazes unseen space or an
-            // obstacle, pull the seed back towards the vehicle (last try: the vehicle itself).
-            bool poly_ok = false;
-            for (int attempt = 0; attempt < 4 && !poly_ok; ++attempt) {
-                Line line{shifted_robot_p, seed_point};
-                poly_ok = cg_ptr_->GenerateSeenPolytopeFromLine(line, temp_poly);
-                if (!poly_ok) {
-                    seed_point_t = attempt < 2 ? start_t + 0.5 * (seed_point_t - start_t) : start_t;
-                    seed_point = ref_exp_traj.getPos(seed_point_t);
-                }
-            }
-            if (!poly_ok) {
+            // [px4_oa] Corridor in seen-free space. The generator shortens the seed line to the
+            // part that is clear of unseen space and obstacles (down to the vehicle itself).
+            Line line{shifted_robot_p, seed_point};
+            if (!cg_ptr_->GenerateSeenPolytopeFromLine(line, temp_poly)) {
                 ros_ptr_->warn(" -- [SUPER] No seen-free backup corridor, force return");
                 return FAILED;
             }
+            seed_point = line.second;
         } else {
             Line line{shifted_robot_p, seed_point};
             if (!cg_ptr_->GeneratePolytopeFromLine(line, temp_poly)) {
@@ -1009,7 +1002,17 @@ namespace super_planner {
                 ++k;
             }
             if (k == 0) {
-                ros_ptr_->warn(" -- [SUPER] Exp traj leaves seen-free space at once, no backup.");
+                const auto &pl = temp_poly.GetPlanes();
+                const Vec3f &p0 = eval_ps[0].second;
+                Eigen::Index worst;
+                const double out = (pl.leftCols<3>() * p0 + pl.rightCols<1>()).maxCoeff(&worst);
+                const Vec3f n = pl.row(worst).head<3>().normalized();
+                const auto &st = cg_ptr_->seen_stats;
+                ros_ptr_->warn(" -- [SUPER] Exp traj leaves seen-free space at once, no backup."
+                               " (first step {:.2f} m, {:.2f} m past the {} face towards [{:.1f} {:.1f} {:.1f}];"
+                               " nearest occupied {:.2f} m, unseen {:.2f} m; seed {:.2f} of {:.2f} m)",
+                               (p0 - shifted_robot_p).norm(), out, worst < st.ciri_faces ? "corridor" : "near-point",
+                               n.x(), n.y(), n.z(), st.nearest_occ, st.nearest_unseen, st.seed_kept, st.seed_asked);
                 return FAILED;
             }
             if (k < eval_ps.size()) {

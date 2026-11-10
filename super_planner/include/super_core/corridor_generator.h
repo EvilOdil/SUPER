@@ -114,7 +114,15 @@ namespace super_planner {
         /// start (the vehicle is there) cannot be kept robot_r away; each becomes a half-space
         /// "do not move towards it" through the start instead, so the vehicle can back away
         /// from a branch it drifted into but never creeps closer to it or into unseen space.
+        /// `line.second` is pulled back to the part of the seed that is clear (see .cpp).
         bool GenerateSeenPolytopeFromLine(Line &line, Polytope &polytope);
+
+        /// What the last GenerateSeenPolytopeFromLine saw around the start, for log messages.
+        struct SeenStats {
+            double nearest_occ{-1}, nearest_unseen{-1};  // [m] from the start; -1: none in the box
+            double seed_asked{0}, seed_kept{0};          // [m] seed line before / after shortening
+            int ciri_faces{0};                           // faces [0, ciri_faces) are CIRI / box, the rest "near" half-spaces
+        } seen_stats;
 
     private:
         void collectSeenBoundary(const Vec3f &box_min, const Vec3f &box_max, vec_E<Vec3f> &out) const;
