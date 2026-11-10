@@ -24,6 +24,12 @@
 
 #pragma once
 
+// [px4_oa] Always included, and the members below always present: this header is compiled by
+// other packages too (super_planner), and the class layout must not depend on a build flag.
+#include "rog_map/cuda/raycast_backend.h"
+#include <cstdlib>
+#include <memory>
+#include <new>
 #include <queue>
 #include <rog_map/inf_map.h>
 #include <rog_map/free_cnt_map.h>
@@ -105,7 +111,35 @@ namespace rog_map {
         FreeCntMap::Ptr fcnt_map_;
         ESDFMap::Ptr esdf_map_;
         /// Spherical neighborhood lookup table
-        std::vector<float> occupancy_buffer_;
+        // [px4_oa] The log-odds map: ordinary memory, or (CUDA backend) the pinned buffer the GPU
+        // updates in place. Read by the planner at all times.
+        class MapBuffer {
+        public:
+            MapBuffer() = default;
+            ~MapBuffer() { if (owned_) { std::free(data_); } }
+            MapBuffer(const MapBuffer &) = delete;
+            MapBuffer &operator=(const MapBuffer &) = delete;
+            void allocate(const size_t n) {
+                data_ = static_cast<float *>(std::calloc(n, sizeof(float)));
+                if (!data_) { throw std::bad_alloc(); }
+                size_ = n;
+                owned_ = true;
+            }
+            void adopt(float *external, const size_t n) { data_ = external; size_ = n; owned_ = false; }
+            float &operator[](const size_t i) { return data_[i]; }
+            const float &operator[](const size_t i) const { return data_[i]; }
+            float *begin() { return data_; }
+            float *end() { return data_ + size_; }
+            const float *begin() const { return data_; }
+            const float *end() const { return data_ + size_; }
+            size_t size() const { return size_; }
+        private:
+            float *data_{nullptr};
+            size_t size_{0};
+            bool owned_{false};
+        } occupancy_buffer_;
+        std::unique_ptr<cuda::RaycastBackend> gpu_;  // set: raycast + cell update run on the GPU
+        int gpu_rays_{0};                            // rays queued in gpu_->rays()
 
         bool map_empty_{true};
         struct RaycastData {
@@ -162,5 +196,6 @@ namespace rog_map {
         void updateLocalBox(const Vec3f &cur_odom);
 
         void resetLocalMap() override;
+        void flushGpuRays();  // trace the rays queued in gpu_->rays()
     };
 }

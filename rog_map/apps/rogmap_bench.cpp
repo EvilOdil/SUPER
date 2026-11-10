@@ -3,6 +3,7 @@
 // the resulting map to compare backends exactly. See docs/cuda_rogmap_plan.md.
 //
 //   rogmap_bench <config.yaml> <frames.bin> [--max-frames N] [--csv out.csv] [--queries N]
+//                [--backend cpu|cuda]   (overrides rog_map/raycasting/backend)
 //
 // frames.bin (scripts/bag_to_rogmap_frames.py), little endian: "RMB1", then per frame
 //   double t; double p[3]; double q[4] (w x y z); uint32 n; float xyzi[4 * n]
@@ -27,9 +28,26 @@ double msSince(const Clock::time_point &t0) {
 
 class BenchMap : public rog_map::ROGMap {
 public:
-    explicit BenchMap(const std::string &cfg_path) {
+    BenchMap(const std::string &cfg_path, const std::string &backend) {
         cfg_ = rog_map::Config(cfg_path);
+        if (!backend.empty()) {
+            cfg_.raycast_backend = backend;
+        }
         init();
+    }
+
+    // Inflated-occupied cells of the inflation map, over the whole local map: equal on both backends.
+    size_t inflatedOccupied() const {
+        const double r = getInfResolution();
+        size_t n = 0;
+        for (double x = local_map_bound_min_d_.x() + r / 2; x < local_map_bound_max_d_.x(); x += r) {
+            for (double y = local_map_bound_min_d_.y() + r / 2; y < local_map_bound_max_d_.y(); y += r) {
+                for (double z = local_map_bound_min_d_.z() + r / 2; z < local_map_bound_max_d_.z(); z += r) {
+                    n += isOccupiedInflate(rog_map::Vec3f(x, y, z));
+                }
+            }
+        }
+        return n;
     }
 
     const double getSystemWalltimeNow() override {
@@ -102,12 +120,12 @@ double pct(std::vector<double> v, const double q) {
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <config.yaml> <frames.bin> [--max-frames N] [--csv out.csv] [--queries N]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <config.yaml> <frames.bin> [--max-frames N] [--csv out.csv] [--queries N] [--backend cpu|cuda]\n", argv[0]);
         return 2;
     }
     long max_frames = -1;
     int queries = 1000000;
-    std::string csv_path;
+    std::string csv_path, backend;
     for (int i = 3; i + 1 < argc; i += 2) {
         const std::string a = argv[i];
         if (a == "--max-frames") {
@@ -116,6 +134,8 @@ int main(int argc, char **argv) {
             csv_path = argv[i + 1];
         } else if (a == "--queries") {
             queries = std::stoi(argv[i + 1]);
+        } else if (a == "--backend") {
+            backend = argv[i + 1];
         } else {
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
             return 2;
@@ -129,7 +149,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    BenchMap map(argv[1]);
+    BenchMap map(argv[1], backend);
     std::FILE *csv = csv_path.empty() ? nullptr : std::fopen(csv_path.c_str(), "w");
     if (csv) {
         std::fprintf(csv, "frame,t,points,total_ms,raycast_ms,update_ms,inflation_ms,cells\n");
@@ -199,8 +219,8 @@ int main(int argc, char **argv) {
     uint64_t hash;
     size_t occ, fre, unk;
     map.digest(hash, occ, fre, unk);
-    std::printf("map digest: %016llx  occupied %zu  free %zu  unknown %zu\n", static_cast<unsigned long long>(hash), occ,
-                fre, unk);
+    std::printf("map digest: %016llx  occupied %zu  free %zu  unknown %zu  inflated-occupied %zu\n",
+                static_cast<unsigned long long>(hash), occ, fre, unk, map.inflatedOccupied());
     std::printf("memory: %ld MB resident\n", rssMb());
     return 0;
 }

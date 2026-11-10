@@ -80,10 +80,32 @@ void ProbMap::initProbMap() {
     int map_size = sc_.map_size_i.prod();
 
 
-    occupancy_buffer_.resize(map_size, 0);
     raycast_data_.raycaster.setResolution(cfg_.resolution);
-    raycast_data_.operation_cnt.resize(map_size, 0);
-    raycast_data_.hit_cnt.resize(map_size, 0);
+    if (cfg_.raycast_backend == "cuda") {
+#ifdef ROGMAP_CUDA
+        std::string why_not;
+        if (!cfg_.raycasting_en || cfg_.esdf_en || cfg_.frontier_extraction_en || cfg_.load_pcd_en) {
+            why_not = "needs raycasting on; ESDF, frontier extraction and load_pcd off";
+        } else {
+            gpu_ = cuda::RaycastBackend::create(map_size, why_not);
+        }
+        if (gpu_) {
+            occupancy_buffer_.adopt(gpu_->occupancy(), map_size);
+            std::cout << GREEN << " -- [ProbMap] raycasting backend: CUDA -- ." << RESET << std::endl;
+        } else {
+            std::cout << YELLOW << " -- [ProbMap] raycasting backend: CUDA not usable (" << why_not
+                << "), using the CPU -- ." << RESET << std::endl;
+        }
+#else
+        std::cout << YELLOW << " -- [ProbMap] raycasting backend: built without CUDA, using the CPU -- ."
+            << RESET << std::endl;
+#endif
+    }
+    if (occupancy_buffer_.size() == 0) {  // CPU backend: counters on the host too
+        occupancy_buffer_.allocate(map_size);
+        raycast_data_.operation_cnt.resize(map_size, 0);
+        raycast_data_.hit_cnt.resize(map_size, 0);
+    }
 
     resetLocalMap();
 
@@ -556,6 +578,26 @@ void ProbMap::resetCell(const int& hash_id) {
 }
 
 void ProbMap::probabilisticMapFromCache() {
+    if (gpu_) {
+        const cuda::Thresholds thr{cfg_.l_hit, cfg_.l_miss, cfg_.l_min, cfg_.l_max, cfg_.l_occ, cfg_.l_free};
+        const uint32_t* transitions = nullptr;
+        size_t n_transitions = 0, n_touched = 0;
+        {
+            ROGMAP_RANGE("rogmap/gpu_apply");
+            gpu_->apply(thr, transitions, n_transitions, n_touched);
+        }
+        time_consuming_[5] = n_touched;
+        // The inflation map stays on the CPU: fold in the cells that changed type.
+        ROGMAP_RANGE("rogmap/inflation");
+        static const GridType kType[3] = {GridType::UNKNOWN, GridType::KNOWN_FREE, GridType::OCCUPIED};
+        for (size_t i = 0; i < n_transitions; ++i) {
+            Vec3f pos;
+            hashIdToPos(static_cast<int>(cuda::transitionCell(transitions[i])), pos);
+            inf_map_->updateGridCounter(pos, kType[cuda::transitionFrom(transitions[i])],
+                                        kType[cuda::transitionTo(transitions[i])]);
+        }
+        return;
+    }
     //    int addr = getHashIndexFromGlobalIndex(Vec3i(41,
     //                                                 -216,
     //                                                 -6));
@@ -776,17 +818,43 @@ void ProbMap::raycastProcess(const PointCloud& input_cloud, const Vec3f& cur_odo
         // 1.4) for all validate hit points, update probability
         raycasting_cloud.push_back(p);
 
+        if (gpu_) {
+            // Queue the ray for the GPU, prepared exactly as the CPU path below traces it.
+            if (gpu_rays_ == gpu_->maxRays()) {
+                flushGpuRays();
+            }
+            cuda::Ray& ray = gpu_->rays()[gpu_rays_++];
+            const Vec3f start = (p - cur_odom).normalized() * cfg_.raycast_range_min + cur_odom;
+            for (int a = 0; a < 3; ++a) {
+                ray.start[a] = start[a];
+                ray.end[a] = p[a];
+            }
+            ray.hit_cell = -1;
+            if (update_hit) {
+                posToGlobalIndex(p, pt_id_g);
+                ray.hit_cell = getHashIndexFromGlobalIndex(pt_id_g);
+            }
+            continue;
+        }
         if (update_hit) {
             posToGlobalIndex(p, pt_id_g);
             insertUpdateCandidate(pt_id_g, true);
         }
+    }
+    if (gpu_) {
+        flushGpuRays();
+        return;
     }
 
     if (cfg_.raycasting_en) {
         // 4) process all inf points, updae free probability
         for (const auto& p : raycasting_cloud) {
             Vec3f raycast_start = (p - cur_odom).normalized() * cfg_.raycast_range_min + cur_odom;
-            raycast_data_.raycaster.setInput(raycast_start, p);
+            if (!raycast_data_.raycaster.setInput(raycast_start, p)) {
+                // [px4_oa] start and end in one cell: nothing to trace. Upstream stepped on with
+                // the previous ray's state here.
+                continue;
+            }
             Vec3f ray_pt;
             while (raycast_data_.raycaster.step(ray_pt)) {
                 Vec3i cur_ray_id_g;
@@ -798,6 +866,19 @@ void ProbMap::raycastProcess(const PointCloud& input_cloud, const Vec3f& cur_odo
             }
         }
     }
+}
+
+void ProbMap::flushGpuRays() {
+    ROGMAP_RANGE("rogmap/gpu_trace");
+    cuda::Geometry g;
+    g.resolution = cfg_.resolution;
+    for (int a = 0; a < 3; ++a) {
+        g.map_size[a] = sc_.map_size_i(a);
+        g.half_map_size[a] = sc_.half_map_size_i(a);
+        g.origin[a] = local_map_origin_i_(a);
+    }
+    gpu_->trace(gpu_rays_, g);
+    gpu_rays_ = 0;
 }
 
 void ProbMap::insertUpdateCandidate(const Vec3i& id_g, bool is_hit) {
@@ -853,4 +934,7 @@ void ProbMap::resetLocalMap() {
     raycast_data_.batch_update_counter = 0;
     std::fill(raycast_data_.operation_cnt.begin(), raycast_data_.operation_cnt.end(), 0);
     std::fill(raycast_data_.hit_cnt.begin(), raycast_data_.hit_cnt.end(), 0);
+    if (gpu_) {
+        gpu_->clearCounters();
+    }
 }

@@ -4,13 +4,15 @@ project(rog_map)
 set(CMAKE_CXX_STANDARD 17)
 #set(CMAKE_BUILD_TYPE "Debug")
 set(CMAKE_BUILD_TYPE "Release")
-set(CMAKE_CXX_FLAGS "-O3 -Wall -g -fPIC")
+# [px4_oa] -ffp-contract=off: no fused multiply-add, so the CPU path and the CUDA kernels
+# (-fmad=false) round the same way and their maps can be compared exactly.
+set(CMAKE_CXX_FLAGS "-O3 -Wall -g -fPIC -ffp-contract=off")
 add_compile_options(-DQT_NO_VERSION_TAGGING)
-add_compile_options(-Werror=unused-variable)
-add_compile_options(-Werror=return-type)
+add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Werror=unused-variable>)  # [px4_oa] not for nvcc
+add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Werror=return-type>)  # [px4_oa] not for nvcc
 
 # reduce warning
-add_compile_options(-Wno-dev)
+add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-dev>)  # [px4_oa] not for nvcc
 cmake_policy(SET CMP0057 NEW)
 cmake_policy(SET CMP0054 NEW)
 set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS 1 CACHE BOOL "Suppress developer warnings")
@@ -63,7 +65,35 @@ include_directories(
 
 file(GLOB_RECURSE srcs CONFIGURE_DEPENDS src/*.cpp include/*.h include/*.hpp include/*.cpp)
 
+# [px4_oa] CUDA backend for the probabilistic update (docs/cuda_rogmap_plan.md). Built when a
+# CUDA compiler is found (PATH, CUDACXX or /usr/local/cuda); selected at run time with
+# rog_map/raycasting/backend: cuda. -DROGMAP_CUDA=OFF builds without it.
+option(ROGMAP_CUDA "Build the CUDA raycasting backend if a CUDA compiler is found" ON)
+if (ROGMAP_CUDA)
+    if (NOT CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX} AND EXISTS /usr/local/cuda/bin/nvcc)
+        set(CMAKE_CUDA_COMPILER /usr/local/cuda/bin/nvcc)
+    endif ()
+    include(CheckLanguage)
+    check_language(CUDA)
+    if (CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        find_package(CUDAToolkit REQUIRED)
+        set(CMAKE_CUDA_STANDARD 17)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -fmad=false")
+        list(APPEND srcs src/cuda/raycast_backend.cu)
+        message(STATUS "rog_map: CUDA backend on (${CMAKE_CUDA_COMPILER})")
+    else ()
+        message(STATUS "rog_map: no CUDA compiler found, CPU backend only")
+        set(ROGMAP_CUDA OFF)
+    endif ()
+endif ()
+
 add_library(rog_map STATIC ${srcs})
+if (ROGMAP_CUDA)
+    target_compile_definitions(rog_map PUBLIC ROGMAP_CUDA)
+    target_link_libraries(rog_map PUBLIC ${CUDA_cudart_LIBRARY})
+    list(APPEND third_party_libs ${CUDA_cudart_LIBRARY})
+endif ()
 
 target_include_directories(rog_map PUBLIC include)
 target_link_libraries(rog_map PUBLIC

@@ -98,7 +98,8 @@ namespace rog_map {
          * when occ_cnt > 0, this grid is considered to be occupied
          * when unk_cnt > sub_grid_num * unk_ratio, this grid is considered to be unknown?
          * */
-        TimeConsuming update_t("updateGridCounter", false);
+        // [px4_oa] removed an unused TimeConsuming here: it built a string and read the clock for
+        // every cell that changes type (hundreds of thousands per lidar frame).
         map_empty_ = false;
         Vec3i id_l, id_g;
         posToGlobalIndex(pos, id_g);

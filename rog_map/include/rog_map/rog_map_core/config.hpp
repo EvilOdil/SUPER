@@ -177,6 +177,8 @@ namespace rog_map {
             // raycasting
             loader.LoadParam(name_space + "/raycasting/enable", raycasting_en, true);
             loader.LoadParam(name_space + "/raycasting/batch_update_size", batch_update_size, 1);
+            // [px4_oa] "cpu" or "cuda" (needs a build with CUDA; falls back to cpu with a warning)
+            loader.LoadParam(name_space + "/raycasting/backend", raycast_backend, string("cpu"));
             if (batch_update_size <= 0) {
                 std::cout <<  color_text::YELLOW << " -- [ROG] batch_update_size should be larger or equal than 1, it is set to 1 now."
                           << RESET << std::endl;
@@ -330,6 +332,7 @@ namespace rog_map {
         double raycast_range_min{}, raycast_range_max{};
         double sqr_raycast_range_min{}, sqr_raycast_range_max{};
         int point_filt_num{}, batch_update_size{};
+        string raycast_backend{"cpu"};
         float p_hit{}, p_miss{}, p_min{}, p_max{}, p_occ{}, p_free{};
         float l_hit{}, l_miss{}, l_min{}, l_max{}, l_occ{}, l_free{};
 
