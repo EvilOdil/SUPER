@@ -484,6 +484,11 @@ namespace path_search {
 
                         neighborPtr->rounds = rounds_;
                         double distance_score = sqrt(dx * dx + dy * dy + dz * dz);
+                        // [px4_oa] unseen cells cost more: prefer routes the lidar has seen
+                        if (cfg_.unknown_cost > 1.0 && md_.unknown_as_free &&
+                            map_ptr_->isUnknown(neighborPos)) {
+                            distance_score *= cfg_.unknown_cost;
+                        }
                         distance_score = current->distance_score + distance_score;
                         rog_map::Vec3f pos;
                         globalIndexToPos(neighborIdx, pos);
@@ -681,6 +686,11 @@ namespace path_search {
 
                         neighborPtr->rounds = rounds_;
                         double distance_score = sqrt(dx * dx + dy * dy + dz * dz);
+                        // [px4_oa] unseen cells cost more: prefer routes the lidar has seen
+                        if (cfg_.unknown_cost > 1.0 && md_.unknown_as_free &&
+                            map_ptr_->isUnknown(neighborPos)) {
+                            distance_score *= cfg_.unknown_cost;
+                        }
                         distance_score = current->distance_score + distance_score;
                         rog_map::Vec3f pos;
                         globalIndexToPos(neighborIdx, pos);

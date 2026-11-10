@@ -22,6 +22,7 @@
 */
 
 #include <super_core/corridor_generator.h>
+#include <array>
 
 using namespace super_utils;
 
@@ -39,6 +40,7 @@ namespace super_planner {
         seed_line_max_length_ = seed_line_max_dis;
         min_overlap_threshold_ = min_overlap_threshold;
         robot_r_ = robot_r;
+        map_res_ = map_ptr_->getMapConfig().resolution;
         box_search_skip_num_ = box_search_skip_num;
         iris_iter_num_ = iris_iter_num;
         virtual_ceil_height_ = virtual_ceil_height - robot_r;
@@ -374,5 +376,122 @@ namespace super_planner {
             return false;
         }
 
+    }
+
+    void CorridorGenerator::collectSeenBoundary(const Vec3f &box_min, const Vec3f &box_max,
+                                                vec_E<Vec3f> &out) const {
+        // The surface of unseen space: unknown cells next to a seen-free cell, one point per
+        // 2x2x2-cell block (<= 0.35 m apart, so a robot_r ball cannot slip between them).
+        const double res = map_res_;
+        const Vec3f off[6] = {Vec3f(res, 0, 0), Vec3f(-res, 0, 0), Vec3f(0, res, 0),
+                              Vec3f(0, -res, 0), Vec3f(0, 0, res), Vec3f(0, 0, -res)};
+        for (double x = box_min.x() + 0.5 * res; x < box_max.x(); x += 2 * res) {
+            for (double y = box_min.y() + 0.5 * res; y < box_max.y(); y += 2 * res) {
+                for (double z = box_min.z() + 0.5 * res; z < box_max.z(); z += 2 * res) {
+                    bool found = false;
+                    for (int i = 0; i < 8 && !found; ++i) {
+                        const Vec3f p(x + (i & 1) * res, y + ((i >> 1) & 1) * res, z + ((i >> 2) & 1) * res);
+                        if (!map_ptr_->isUnknown(p)) {
+                            continue;
+                        }
+                        for (const auto &o : off) {
+                            if (map_ptr_->isKnownFree(Vec3f(p + o))) {
+                                out.push_back(p);
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bool CorridorGenerator::GenerateSeenPolytopeFromLine(Line &line, Polytope &polytope) {
+        Eigen::Vector3d box_max, box_min;
+        getSeedBBox(line.first, line.second, box_min, box_max);
+        map_ptr_->boundBoxByLocalMap(box_min, box_max);
+        vec_E<Vec3f> occ, unseen, pc;
+        map_ptr_->boxSearch(box_min, box_max, OCCUPIED, occ);
+        collectSeenBoundary(box_min, box_max, unseen);
+        box_min.z() += robot_r_;
+        box_max.z() -= robot_r_;
+
+        // Split: points >= robot_r from the start go to CIRI; closer ones become half-spaces,
+        // averaged over 26 direction bins.
+        const Vec3f s = line.first;
+        Eigen::Matrix<double, 3, 26> near_dir = Eigen::Matrix<double, 3, 26>::Zero();
+        std::array<bool, 26> near_used{};
+        auto bin_of = [](const Vec3f &d) {
+            auto q = [](double v) { return v > 0.38 ? 2 : (v < -0.38 ? 0 : 1); };
+            const int id = q(d.x()) * 9 + q(d.y()) * 3 + q(d.z());  // 13 = centre, unreachable for |d| = 1
+            return id < 13 ? id : id - 1;
+        };
+        pc.reserve(occ.size() + unseen.size());
+        for (const auto *set : {&occ, &unseen}) {
+            for (const auto &p : *set) {
+                const Vec3f d = p - s;
+                const double n = d.norm();
+                if (n >= robot_r_) {
+                    pc.push_back(p);
+                } else if (n > 1e-6) {
+                    const int b = bin_of(d / n);
+                    near_dir.col(b) += d / n;
+                    near_used[b] = true;
+                }
+            }
+        }
+
+        MatD4f planes;
+        if (pc.empty()) {
+            planes.resize(6, 4);
+            planes.row(0) << 1, 0, 0, -box_max.x();
+            planes.row(1) << 0, 1, 0, -box_max.y();
+            planes.row(2) << 0, 0, 1, -box_max.z();
+            planes.row(3) << -1, 0, 0, box_min.x();
+            planes.row(4) << 0, -1, 0, box_min.y();
+            planes.row(5) << 0, 0, -1, box_min.z();
+        } else {
+            Eigen::Matrix<double, 6, 4> bd = Eigen::Matrix<double, 6, 4>::Zero();
+            bd(0, 0) = 1.0;
+            bd(1, 0) = -1.0;
+            bd(2, 1) = 1.0;
+            bd(3, 1) = -1.0;
+            bd(4, 2) = 1.0;
+            bd(5, 2) = -1.0;
+            bd(0, 3) = -box_max.x();
+            bd(1, 3) = box_min.x();
+            bd(2, 3) = -box_max.y();
+            bd(3, 3) = box_min.y();
+            bd(4, 3) = -box_max.z();
+            bd(5, 3) = box_min.z();
+            latest_pc.insert(latest_pc.end(), pc.begin(), pc.end());
+            Eigen::Map<const Eigen::Matrix<double, 3, -1, Eigen::ColMajor>> pp(pc[0].data(), 3, pc.size());
+            if (ciri_->comvexDecomposition(bd, pp, line.first, line.second) != SUCCESS) {
+                polytope.Reset();
+                return false;
+            }
+            ciri_->getPolytope(polytope);
+            planes = polytope.GetPlanes();
+        }
+
+        int n_near = 0;
+        for (bool u : near_used) {
+            n_near += u;
+        }
+        MatD4f all(planes.rows() + n_near, 4);
+        all.topRows(planes.rows()) = planes;
+        int r = static_cast<int>(planes.rows());
+        for (int b = 0; b < 26; ++b) {
+            if (!near_used[b]) {
+                continue;
+            }
+            const Vec3f n = near_dir.col(b).normalized();
+            all.row(r++) << n.x(), n.y(), n.z(), -n.dot(s) - 0.02;  // n . (x - s) <= 2 cm
+        }
+        polytope.SetPlanes(all);
+        polytope.SetSeedLine(line);
+        Vec3f interior;
+        return geometry_utils::findInterior(all, interior);
     }
 }

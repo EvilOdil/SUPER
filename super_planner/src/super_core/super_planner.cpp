@@ -841,6 +841,21 @@ namespace super_planner {
             return NO_NEED;
         }
 
+        // [px4_oa] With backup_in_seen_space a point is "visible" only through seen-free cells.
+        // Cells within robot_r of the vehicle are left to the corridor's half-spaces (the
+        // vehicle is there; above an inverted lidar they are often never seen).
+        auto line_seen = [&](const Vec3f &a, const Vec3f &b) {
+            const double len = (b - a).norm();
+            const int n = static_cast<int>(std::ceil(len / cfg_.resolution));
+            for (int i = 1; i <= n; ++i) {
+                const Vec3f p = a + (b - a) * (static_cast<double>(i) / n);
+                if ((p - a).norm() >= cfg_.robot_r && map_ptr_->isUnknown(p)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
         Vec3f temp_point;
         double out_t;
         bool all_traj_visible{true};
@@ -869,6 +884,10 @@ namespace super_planner {
                                       temp_point,
                                       min_dis,
                                       cfg_.seed_line_neighbour)) {
+                all_traj_visible = false;
+                break;
+            }
+            if (cfg_.backup_in_seen_space && !line_seen(back_traj_info.getRobotPos(), temp_point)) {
                 all_traj_visible = false;
                 break;
             }
@@ -924,11 +943,29 @@ namespace super_planner {
             return FAILED;
         }
 
-        Line line{shifted_robot_p, seed_point};
         Polytope temp_poly;
-        if (!cg_ptr_->GeneratePolytopeFromLine(line, temp_poly)) {
-            ros_ptr_->warn(" -- [SUPER] GeneratePolytopeFromLine failed, force return");
-            return FAILED;
+        if (cfg_.backup_in_seen_space) {
+            // [px4_oa] Corridor in seen-free space. If the seed line grazes unseen space or an
+            // obstacle, pull the seed back towards the vehicle (last try: the vehicle itself).
+            bool poly_ok = false;
+            for (int attempt = 0; attempt < 4 && !poly_ok; ++attempt) {
+                Line line{shifted_robot_p, seed_point};
+                poly_ok = cg_ptr_->GenerateSeenPolytopeFromLine(line, temp_poly);
+                if (!poly_ok) {
+                    seed_point_t = attempt < 2 ? start_t + 0.5 * (seed_point_t - start_t) : start_t;
+                    seed_point = ref_exp_traj.getPos(seed_point_t);
+                }
+            }
+            if (!poly_ok) {
+                ros_ptr_->warn(" -- [SUPER] No seen-free backup corridor, force return");
+                return FAILED;
+            }
+        } else {
+            Line line{shifted_robot_p, seed_point};
+            if (!cg_ptr_->GeneratePolytopeFromLine(line, temp_poly)) {
+                ros_ptr_->warn(" -- [SUPER] GeneratePolytopeFromLine failed, force return");
+                return FAILED;
+            }
         }
         Eigen::Vector3d inner;
         Eigen::Matrix3Xd vPoly;
@@ -964,6 +1001,21 @@ namespace super_planner {
 
 //        Vec3f out_p = temp_point;
 //        double t_R = 0.0;
+        if (cfg_.backup_in_seen_space) {
+            // [px4_oa] The vehicle flies the exp traj up to the backup start: only the prefix
+            // inside the seen-space corridor may be committed.
+            size_t k = 0;
+            while (k < eval_ps.size() && temp_poly.PointIsInside(eval_ps[k].second)) {
+                ++k;
+            }
+            if (k == 0) {
+                ros_ptr_->warn(" -- [SUPER] Exp traj leaves seen-free space at once, no backup.");
+                return FAILED;
+            }
+            if (k < eval_ps.size()) {
+                eval_ps.resize(k + 1);  // keep the first point outside: popped below
+            }
+        }
         double eval_t = eval_ps.back().first + cfg_.sample_traj_dt;
         last_pos = eval_ps.back().second;
         while (temp_poly.PointIsInside(eval_ps.back().second) && eval_t < total_dur) {
@@ -981,6 +1033,9 @@ namespace super_planner {
             eval_t += cfg_.sample_traj_dt;
         }
         eval_ps.pop_back();
+        if (eval_ps.empty()) {  // [px4_oa] guard: nothing left to commit to
+            return FAILED;
+        }
         seed_point = eval_ps.back().second;
         seed_point_t = eval_ps.back().first;
 

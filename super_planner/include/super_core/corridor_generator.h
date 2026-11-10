@@ -55,6 +55,7 @@ namespace super_planner {
         double seed_line_max_length_;
         double min_overlap_threshold_;
         double robot_r_;
+        double map_res_{0.1};  // [px4_oa] ROG-Map resolution, for collectSeenBoundary
         int box_search_skip_num_;
         int iris_iter_num_;
         double virtual_groud_height_ = 0.0;
@@ -106,6 +107,19 @@ namespace super_planner {
                                    Polytope & polytope);
 
         bool GeneratePolytopeFromLine(Line &line, Polytope &polytope);
+
+        /// [px4_oa] Corridor for a backup (stopping) trajectory that stays in space the lidar
+        /// has SEEN free: obstacles are the occupied cells plus the boundary between seen-free
+        /// and unseen space, both kept robot_r away. Points already closer than robot_r to the
+        /// start (the vehicle is there) cannot be kept robot_r away; each becomes a half-space
+        /// "do not move towards it" through the start instead, so the vehicle can back away
+        /// from a branch it drifted into but never creeps closer to it or into unseen space.
+        bool GenerateSeenPolytopeFromLine(Line &line, Polytope &polytope);
+
+    private:
+        void collectSeenBoundary(const Vec3f &box_min, const Vec3f &box_max, vec_E<Vec3f> &out) const;
+
+    public:
 
         double getCiriComputationTime() {
             if (ciri_cnt == 0) {

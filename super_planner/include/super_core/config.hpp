@@ -51,6 +51,9 @@ namespace super_planner {
         bool goal_vel_en,goal_yaw_en;
         bool visual_process;
         bool frontend_in_known_free;
+        // [px4_oa] Backup (stopping) trajectories only in space the lidar has seen free; the
+        // exploratory trajectory may still cross unseen space. See generateBackupTrajectory.
+        bool backup_in_seen_space{false};
 
         double resolution;
         double planning_horizon;
@@ -90,6 +93,7 @@ namespace super_planner {
             loader.LoadParam("super_planner/visual_process", visual_process, false);
             loader.LoadParam("super_planner/use_fov_cut", use_fov_cut, false);
             loader.LoadParam("super_planner/frontend_in_known_free", frontend_in_known_free, false);
+            loader.LoadParam("super_planner/backup_in_seen_space", backup_in_seen_space, false);
             loader.LoadParam("super_planner/safe_corridor_line_max_length", safe_corridor_line_max_length, 3.0);
             loader.LoadParam("super_planner/sensing_horizon", sensing_horizon, 3.0);
             loader.LoadParam("super_planner/obs_skip_num", obs_skip_num, 1);

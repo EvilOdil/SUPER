@@ -44,6 +44,9 @@ namespace path_search {
         bool debug_visualization_en;
         bool allow_diag{false};
         int heu_type{0};
+        // [px4_oa] Path cost multiplier for unseen cells when they count as free (1 = off): the
+        // search prefers routes through seen space but may still cross unseen space.
+        double unknown_cost{1.0};
 
         PathSearchConfig() {};
 
@@ -55,6 +58,7 @@ namespace path_search {
             loader.LoadParam(name_space + "/debug_visualization_en", debug_visualization_en, false);
             loader.LoadParam(name_space + "/heu_type", heu_type, 0);
             loader.LoadParam(name_space + "/visual_process", visual_process, false);
+            loader.LoadParam(name_space + "/unknown_cost", unknown_cost, 1.0);
             map_voxel_num = Vec3i(vox_[0], vox_[1], vox_[2]);
             map_size_i = map_voxel_num / 2;
             map_voxel_num = map_size_i * 2 + Vec3i::Constant(1);
