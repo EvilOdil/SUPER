@@ -87,7 +87,7 @@ void ProbMap::initProbMap() {
         if (!cfg_.raycasting_en || cfg_.esdf_en || cfg_.frontier_extraction_en || cfg_.load_pcd_en) {
             why_not = "needs raycasting on; ESDF, frontier extraction and load_pcd off";
         } else {
-            gpu_ = cuda::RaycastBackend::create(map_size, why_not);
+            gpu_ = cuda::RaycastBackend::create(map_size, inf_map_->cellCount(), why_not);
         }
         if (gpu_) {
             occupancy_buffer_.adopt(gpu_->occupancy(), map_size);
@@ -318,8 +318,28 @@ void ProbMap::updateOccPointCloud(const PointCloud& input_cloud) {
 }
 
 void ProbMap::slideAllMap(const rog_map::Vec3f& pos) {
-    mapSliding(pos);
-    inf_map_->mapSliding(pos);
+    ROGMAP_RANGE("rogmap/slide");
+    if (gpu_) {
+        // The slabs that leave the map are reset on the GPU (clearMemoryOutOfMap below); their
+        // changes reach the inflation map before that slides too: the order the CPU path has.
+        gpu_clear_slabs_ = true;
+    }
+    {
+        ROGMAP_RANGE("rogmap/slide_map");
+        mapSliding(pos);
+    }
+    if (gpu_) {
+        ROGMAP_RANGE("rogmap/slide_gpu_clear");
+        gpu_clear_slabs_ = false;
+        const cuda::CounterDelta* deltas = nullptr;
+        size_t n_deltas = 0;
+        gpu_->finishClear(deltas, n_deltas);
+        inf_map_->applyCounterDeltas(deltas, n_deltas);
+    }
+    {
+        ROGMAP_RANGE("rogmap/slide_inflation");
+        inf_map_->mapSliding(pos);
+    }
     if (cfg_.frontier_extraction_en) {
         fcnt_map_->mapSliding(pos);
     }
@@ -544,6 +564,20 @@ void ProbMap::boundBoxByLocalMap(Vec3f& box_min, Vec3f& box_max) const {
     box_min.z() = std::max(box_min.z(), cfg_.virtual_ground_height);
 }
 
+void ProbMap::clearMemoryOutOfMap(const std::vector<int>& clear_id, const int& i) {
+    if (!gpu_clear_slabs_) {
+        SlidingMap::clearMemoryOutOfMap(clear_id, i);
+        return;
+    }
+    // Called before the map's origin moves: gpuGeometry() is still the grid the cells are in.
+    const cuda::Thresholds thr{cfg_.l_hit, cfg_.l_miss, cfg_.l_min, cfg_.l_max, cfg_.l_occ, cfg_.l_free};
+    const int max_slabs = cuda::RaycastBackend::kMaxSlabs;
+    for (size_t k = 0; k < clear_id.size(); k += max_slabs) {
+        gpu_->clearSlabs(i, clear_id.data() + k, static_cast<int>(std::min<size_t>(max_slabs, clear_id.size() - k)),
+                         thr, gpuGeometry(), inf_map_->gpuGeometry());
+    }
+}
+
 void ProbMap::resetCell(const int& hash_id) {
     float& ret = occupancy_buffer_[hash_id];
     if (isOccupied(ret)) {
@@ -580,22 +614,16 @@ void ProbMap::resetCell(const int& hash_id) {
 void ProbMap::probabilisticMapFromCache() {
     if (gpu_) {
         const cuda::Thresholds thr{cfg_.l_hit, cfg_.l_miss, cfg_.l_min, cfg_.l_max, cfg_.l_occ, cfg_.l_free};
-        const uint32_t* transitions = nullptr;
-        size_t n_transitions = 0, n_touched = 0;
+        const cuda::CounterDelta* deltas = nullptr;
+        size_t n_deltas = 0, n_touched = 0;
         {
             ROGMAP_RANGE("rogmap/gpu_apply");
-            gpu_->apply(thr, transitions, n_transitions, n_touched);
+            gpu_->apply(thr, gpuGeometry(), inf_map_->gpuGeometry(), deltas, n_deltas, n_touched);
         }
         time_consuming_[5] = n_touched;
-        // The inflation map stays on the CPU: fold in the cells that changed type.
+        // The inflation map stays on the CPU: the GPU summed the type changes per inflation cell.
         ROGMAP_RANGE("rogmap/inflation");
-        static const GridType kType[3] = {GridType::UNKNOWN, GridType::KNOWN_FREE, GridType::OCCUPIED};
-        for (size_t i = 0; i < n_transitions; ++i) {
-            Vec3f pos;
-            hashIdToPos(static_cast<int>(cuda::transitionCell(transitions[i])), pos);
-            inf_map_->updateGridCounter(pos, kType[cuda::transitionFrom(transitions[i])],
-                                        kType[cuda::transitionTo(transitions[i])]);
-        }
+        inf_map_->applyCounterDeltas(deltas, n_deltas);
         return;
     }
     //    int addr = getHashIndexFromGlobalIndex(Vec3i(41,
@@ -870,14 +898,7 @@ void ProbMap::raycastProcess(const PointCloud& input_cloud, const Vec3f& cur_odo
 
 void ProbMap::flushGpuRays() {
     ROGMAP_RANGE("rogmap/gpu_trace");
-    cuda::Geometry g;
-    g.resolution = cfg_.resolution;
-    for (int a = 0; a < 3; ++a) {
-        g.map_size[a] = sc_.map_size_i(a);
-        g.half_map_size[a] = sc_.half_map_size_i(a);
-        g.origin[a] = local_map_origin_i_(a);
-    }
-    gpu_->trace(gpu_rays_, g);
+    gpu_->trace(gpu_rays_, gpuGeometry());
     gpu_rays_ = 0;
 }
 

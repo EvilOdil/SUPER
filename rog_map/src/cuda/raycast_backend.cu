@@ -6,9 +6,11 @@
 //     per-cell counter (low 16 bits: touches, high 16: hits). The thread whose atomicAdd finds
 //     the counter empty owns the cell's entry in the touched list (the CPU code's queue).
 //   kernel 2 (applyCells): one thread per touched cell. Each cell appears once in the list, so
-//     each thread owns its cell: no atomics on the map. Cells that change type are appended to
-//     the transition list, which the CPU folds into the inflation map.
-//   Both run on one stream, in order, with one blocking wait per frame.
+//     each thread owns its cell: no atomics on the map. A cell that changes type adds its change
+//     to its counter-map (inflation) cell with one atomicAdd.
+//   kernel 3 (gatherDeltas): one thread per counter-map cell; lists the cells with a change for
+//     the CPU, which keeps the inflation logic.
+//   All run on one stream, in order.
 // Shared writes go through atomics only; results are integer sums and per-cell updates, so the
 // map is identical to the CPU path's whatever the thread order. Compiled with -fmad=false, and
 // the CPU path with -ffp-contract=off, so the floating-point steps round identically too.
@@ -24,18 +26,18 @@ namespace rog_map {
 namespace cuda {
 namespace {
 
-// Touched cells / transitions per apply(). A frame of ~18,000 rays touches ~2.5 M cells.
+// Touched cells per apply(). A frame of ~18,000 rays touches ~2.5 M cells.
 // Past this the touched list is abandoned and applyDense scans every cell instead.
 constexpr uint32_t kListCap = 8u << 20;
 constexpr int kMaxRays = 1 << 18;
-constexpr uint32_t kMaxCells = 1u << 26;  // cell index bits in a transition
+constexpr uint32_t kDeltaCap = 4u << 20;  // counter-map cells changed per apply()
 
 // List lengths. Device memory, not pinned host memory: every first touch of a cell does an
 // atomicAdd here, and the GPU does not cache pinned host memory. Copied to the host (8 bytes)
 // after each wait.
 struct Counts {
     uint32_t touched;
-    uint32_t transitions;
+    uint32_t deltas;
 };
 
 #define ROGMAP_CUDA_CHECK(call)                                                                  \
@@ -133,16 +135,38 @@ __global__ void traceRays(const Ray *rays, const int n, const Geometry g, uint32
     }
 }
 
+enum : uint32_t { kUnknown = 0, kKnownFree = 1, kOccupied = 2 };
+
 __device__ __forceinline__ uint32_t typeOf(const float l, const Thresholds &t) {
     return l >= t.l_occ ? kOccupied : (l < t.l_free ? kKnownFree : kUnknown);
 }
 
+// The counter-map cell holding probability-map cell `cell`: SlidingMap::hashIdToPos on the
+// probability map, then posToGlobalIndex + getHashIndexFromGlobalIndex on the counter map.
+__device__ __forceinline__ uint32_t counterCellOf(const uint32_t cell, const Geometry &m, const Geometry &c) {
+    int l[3], cl[3];
+    l[0] = static_cast<int>(cell / (m.map_size[1] * m.map_size[2]));
+    l[1] = static_cast<int>((cell - l[0] * m.map_size[1] * m.map_size[2]) / m.map_size[2]);
+    l[2] = static_cast<int>(cell - l[0] * m.map_size[1] * m.map_size[2] - l[1] * m.map_size[2]);
+    for (int a = 0; a < 3; ++a) {
+        l[a] -= m.half_map_size[a];
+        // SlidingMap::localIndexToGlobalIndex
+        const int min_g = -m.half_map_size[a] + m.origin[a];
+        const int min_l = localOf(min_g, m.map_size[a], m.half_map_size[a]);
+        int d = l[a] - min_l;
+        d = d < 0 ? m.map_size[a] + d : d;
+        const double pos = (d + min_g + 0.5) * m.resolution;
+        cl[a] = localOf(static_cast<int>(floor(pos * c.resolution_inv)), c.map_size[a], c.half_map_size[a]);
+    }
+    return hashOf(cl, c);
+}
+
 // ProbMap::hitPointUpdate / missPointUpdate for one cell; zeroes its counter.
-__device__ __forceinline__ void applyCell(const uint32_t cell, const Thresholds &t, float *occupancy,
-                                          uint32_t *counter, uint32_t *transitions, Counts *counts) {
-    const uint32_t c = counter[cell];
+__device__ __forceinline__ void applyCell(const uint32_t cell, const Thresholds &t, const Geometry &m,
+                                          const Geometry &c, float *occupancy, uint32_t *counter, int *delta) {
+    const uint32_t packed = counter[cell];
     counter[cell] = 0;
-    const int touches = static_cast<int>(c & 0xffffu), hits = static_cast<int>(c >> 16);
+    const int touches = static_cast<int>(packed & 0xffffu), hits = static_cast<int>(packed >> 16);
     float l = occupancy[cell];
     const uint32_t from = typeOf(l, t);
     if (hits > 0) {
@@ -159,33 +183,81 @@ __device__ __forceinline__ void applyCell(const uint32_t cell, const Thresholds 
     occupancy[cell] = l;
     const uint32_t to = typeOf(l, t);
     if (from != to) {
-        const uint32_t slot = atomicAdd(&counts->transitions, 1u);
-        if (slot < kListCap) {
-            transitions[slot] = cell | (from << 26) | (to << 28);
-        }
+        // One int per counter-map cell: occupied change in the low 16 bits, unknown change above
+        // (as a plain sum: occupied + 65536 * unknown, both within +-8, the sub-cells of a cell).
+        const int d = (static_cast<int>(to == kOccupied) - static_cast<int>(from == kOccupied)) +
+                      65536 * (static_cast<int>(to == kUnknown) - static_cast<int>(from == kUnknown));
+        atomicAdd(&delta[counterCellOf(cell, m, c)], d);
     }
 }
 
-__global__ void applyCells(const uint32_t *touched, const Thresholds t, float *occupancy, uint32_t *counter,
-                           uint32_t *transitions, Counts *counts) {
+__global__ void applyCells(const uint32_t *touched, const Thresholds t, const Geometry m, const Geometry c,
+                           float *occupancy, uint32_t *counter, int *delta, const Counts *counts) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < counts->touched && i < kListCap) {  // counts->touched is final: traceRays has finished
-        applyCell(touched[i], t, occupancy, counter, transitions, counts);
+        applyCell(touched[i], t, m, c, occupancy, counter, delta);
     }
 }
 
 // Fallback when the touched list overflowed: every cell with a non-empty counter.
-__global__ void applyDense(const uint32_t cells, const Thresholds t, float *occupancy, uint32_t *counter,
-                           uint32_t *transitions, Counts *counts) {
+__global__ void applyDense(const uint32_t cells, const Thresholds t, const Geometry m, const Geometry c,
+                           float *occupancy, uint32_t *counter, int *delta) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < cells && counter[i] != 0) {
-        applyCell(i, t, occupancy, counter, transitions, counts);
+        applyCell(i, t, m, c, occupancy, counter, delta);
+    }
+}
+
+struct Slabs {  // by value to the kernel
+    int axis, n;
+    int local_id[RaycastBackend::kMaxSlabs];
+};
+
+// Map sliding: the cells of whole slabs leave the map and go back to unknown (ProbMap::resetCell
+// over SlidingMap::clearMemoryOutOfMap). One thread per cell. Slabs of different axes overlap and
+// their kernels run one after the other, but the exchange also makes a repeated cell harmless:
+// only one thread sees its old value.
+__global__ void clearSlabs_(const Slabs s, const Thresholds t, const Geometry m, const Geometry c, float *occupancy,
+                           int *delta) {
+    const int a1 = (s.axis + 1) % 3, a2 = (s.axis + 2) % 3;
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t per_slab = static_cast<uint32_t>(m.map_size[a1]) * m.map_size[a2];
+    if (i >= per_slab * s.n) {
+        return;
+    }
+    int l[3];
+    l[s.axis] = s.local_id[i / per_slab];
+    l[a1] = static_cast<int>((i % per_slab) / m.map_size[a2]) - m.half_map_size[a1];
+    l[a2] = static_cast<int>((i % per_slab) % m.map_size[a2]) - m.half_map_size[a2];
+    const uint32_t cell = hashOf(l, m);
+    const uint32_t from = typeOf(atomicExch(&occupancy[cell], 0.0f), t);
+    if (from != kUnknown) {
+        atomicAdd(&delta[counterCellOf(cell, m, c)], 65536 - static_cast<int>(from == kOccupied));
+    }
+}
+
+// Kernel 3: the counter-map cells with a change, for the CPU; zeroes them.
+__global__ void gatherDeltas(const uint32_t counter_cells, int *delta, CounterDelta *out, Counts *counts) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= counter_cells) {
+        return;
+    }
+    const int d = delta[i];
+    if (d == 0) {
+        return;
+    }
+    delta[i] = 0;
+    const uint32_t slot = atomicAdd(&counts->deltas, 1u);
+    if (slot < kDeltaCap) {
+        const int occupied = static_cast<int16_t>(d & 0xffff);  // the low 16 bits, signed
+        out[slot] = CounterDelta{i, static_cast<int16_t>(occupied), static_cast<int16_t>((d - occupied) / 65536)};
     }
 }
 
 class Backend final : public RaycastBackend {
 public:
-    explicit Backend(const size_t cells) : cells_(static_cast<uint32_t>(cells)) {
+    Backend(const size_t cells, const size_t counter_cells)
+        : cells_(static_cast<uint32_t>(cells)), counter_cells_(static_cast<uint32_t>(counter_cells)) {
         try {
             allocate();
         } catch (...) {
@@ -205,11 +277,12 @@ public:
         // pointer is the host pointer), the CPU reads them at normal speed.
         occupancy_ = pinned<float>(cells_, occupancy_dev_);
         rays_ = pinned<Ray>(kMaxRays, rays_dev_);
-        transitions_ = pinned<uint32_t>(kListCap, transitions_dev_);
+        deltas_ = pinned<CounterDelta>(kDeltaCap, deltas_dev_);
         // GPU-only scratch: never read by the CPU in place
         ROGMAP_CUDA_CHECK(cudaMalloc(&counts_dev_, sizeof(Counts)));
         ROGMAP_CUDA_CHECK(cudaMalloc(&counter_, cells_ * sizeof(uint32_t)));
         ROGMAP_CUDA_CHECK(cudaMalloc(&touched_, kListCap * sizeof(uint32_t)));
+        ROGMAP_CUDA_CHECK(cudaMalloc(&delta_, counter_cells_ * sizeof(int)));
         clearCounters();
     }
 
@@ -219,8 +292,9 @@ public:
         }
         cudaFree(touched_);
         cudaFree(counter_);
+        cudaFree(delta_);
         cudaFree(counts_dev_);
-        cudaFreeHost(transitions_);
+        cudaFreeHost(deltas_);
         cudaFreeHost(rays_);
         cudaFreeHost(occupancy_);
         if (stream_) {
@@ -242,37 +316,70 @@ public:
         ROGMAP_CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
 
-    void apply(const Thresholds &t, const uint32_t *&transitions, size_t &n_transitions, size_t &n_touched) override {
+    void apply(const Thresholds &t, const Geometry &map, const Geometry &counter_map, const CounterDelta *&deltas,
+               size_t &n_deltas, size_t &n_touched) override {
         n_touched = readCounts().touched;
         if (n_touched <= kListCap) {
             const uint32_t n = static_cast<uint32_t>(n_touched);
             if (n > 0) {
-                applyCells<<<(n + kBlock - 1) / kBlock, kBlock, 0, stream_>>>(touched_, t, occupancy_dev_, counter_,
-                                                                             transitions_dev_, counts_dev_);
+                applyCells<<<(n + kBlock - 1) / kBlock, kBlock, 0, stream_>>>(touched_, t, map, counter_map,
+                                                                             occupancy_dev_, counter_, delta_, counts_dev_);
             }
         } else {
-            applyDense<<<(cells_ + kBlock - 1) / kBlock, kBlock, 0, stream_>>>(cells_, t, occupancy_dev_, counter_,
-                                                                              transitions_dev_, counts_dev_);
+            applyDense<<<(cells_ + kBlock - 1) / kBlock, kBlock, 0, stream_>>>(cells_, t, map, counter_map,
+                                                                              occupancy_dev_, counter_, delta_);
         }
         ROGMAP_CUDA_CHECK(cudaGetLastError());
-        n_transitions = readCounts().transitions;  // waits for the kernel
-        ROGMAP_CUDA_CHECK(cudaMemsetAsync(counts_dev_, 0, sizeof(Counts), stream_));
-        if (n_transitions > kListCap) {
-            // shortcut: more than 8 M cells changed type in one update cannot be reported to the
-            // inflation map; fail loudly. Upgrade to a chunked read-back if this ever fires.
-            throw std::runtime_error("rog_map CUDA: transition list overflow (" + std::to_string(n_transitions) + ")");
+        gather(deltas, n_deltas);
+    }
+
+    void clearSlabs(const int axis, const int *local_ids, const int n, const Thresholds &t, const Geometry &map,
+                    const Geometry &counter_map) override {
+        Slabs s;
+        s.axis = axis;
+        s.n = n;
+        for (int i = 0; i < n; ++i) {
+            s.local_id[i] = local_ids[i];
         }
-        transitions = transitions_;
+        const uint32_t cells = static_cast<uint32_t>(map.map_size[(axis + 1) % 3]) * map.map_size[(axis + 2) % 3] * n;
+        clearSlabs_<<<(cells + kBlock - 1) / kBlock, kBlock, 0, stream_>>>(s, t, map, counter_map, occupancy_dev_, delta_);
+        ROGMAP_CUDA_CHECK(cudaGetLastError());
+    }
+
+    void finishClear(const CounterDelta *&deltas, size_t &n_deltas) override {
+        const uint32_t touched = readCounts().touched;  // rays traced but not applied yet (batch updates)
+        gather(deltas, n_deltas);
+        if (touched != 0) {  // gather() zeroed the list lengths: put the touched count back
+            const Counts keep{touched, 0};
+            ROGMAP_CUDA_CHECK(cudaMemcpyAsync(counts_dev_, &keep, sizeof(keep), cudaMemcpyHostToDevice, stream_));
+            ROGMAP_CUDA_CHECK(cudaStreamSynchronize(stream_));
+        }
     }
 
     void clearCounters() override {
         ROGMAP_CUDA_CHECK(cudaMemsetAsync(counter_, 0, cells_ * sizeof(uint32_t), stream_));
+        ROGMAP_CUDA_CHECK(cudaMemsetAsync(delta_, 0, counter_cells_ * sizeof(int), stream_));
         ROGMAP_CUDA_CHECK(cudaMemsetAsync(counts_dev_, 0, sizeof(Counts), stream_));
         ROGMAP_CUDA_CHECK(cudaStreamSynchronize(stream_));
     }
 
 private:
     static constexpr int kBlock = 256;
+
+    // Kernel 3 and the hand-over of its list.
+    void gather(const CounterDelta *&deltas, size_t &n_deltas) {
+        gatherDeltas<<<(counter_cells_ + kBlock - 1) / kBlock, kBlock, 0, stream_>>>(counter_cells_, delta_, deltas_dev_,
+                                                                                    counts_dev_);
+        ROGMAP_CUDA_CHECK(cudaGetLastError());
+        n_deltas = readCounts().deltas;  // waits for the kernels
+        ROGMAP_CUDA_CHECK(cudaMemsetAsync(counts_dev_, 0, sizeof(Counts), stream_));
+        if (n_deltas > kDeltaCap) {
+            // shortcut: more than 4 M counter-map cells changed in one update cannot be handed to
+            // the CPU; fail loudly. Upgrade to a chunked read-back if this ever fires.
+            throw std::runtime_error("rog_map CUDA: counter delta list overflow (" + std::to_string(n_deltas) + ")");
+        }
+        deltas = deltas_;
+    }
 
     Counts readCounts() {  // after everything queued on the stream has finished
         Counts c;
@@ -290,22 +397,20 @@ private:
         return static_cast<T *>(host);
     }
 
-    uint32_t cells_;
+    uint32_t cells_, counter_cells_;
     cudaStream_t stream_{};
     float *occupancy_{}, *occupancy_dev_{};
     Ray *rays_{}, *rays_dev_{};
-    uint32_t *transitions_{}, *transitions_dev_{};
+    CounterDelta *deltas_{}, *deltas_dev_{};
+    int *delta_{};  // per counter-map cell, GPU only
     Counts *counts_dev_{};
     uint32_t *counter_{}, *touched_{};
 };
 
 }  // namespace
 
-std::unique_ptr<RaycastBackend> RaycastBackend::create(const size_t cells, std::string &why_not) {
-    if (cells > kMaxCells) {
-        why_not = "map has more than 2^26 cells";
-        return nullptr;
-    }
+std::unique_ptr<RaycastBackend> RaycastBackend::create(const size_t cells, const size_t counter_cells,
+                                                       std::string &why_not) {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
         why_not = "no CUDA device";
@@ -315,7 +420,7 @@ std::unique_ptr<RaycastBackend> RaycastBackend::create(const size_t cells, std::
     // before the context exists; if another library created it first, the default stays.
     cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync | cudaDeviceMapHost);
     try {
-        return std::unique_ptr<RaycastBackend>(new Backend(cells));
+        return std::unique_ptr<RaycastBackend>(new Backend(cells, counter_cells));
     } catch (const std::exception &e) {
         why_not = e.what();
         return nullptr;

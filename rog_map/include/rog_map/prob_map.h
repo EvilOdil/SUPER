@@ -140,6 +140,7 @@ namespace rog_map {
         } occupancy_buffer_;
         std::unique_ptr<cuda::RaycastBackend> gpu_;  // set: raycast + cell update run on the GPU
         int gpu_rays_{0};                            // rays queued in gpu_->rays()
+        bool gpu_clear_slabs_{false};                // map sliding: clear whole slabs on the GPU
 
         bool map_empty_{true};
         struct RaycastData {
@@ -197,5 +198,6 @@ namespace rog_map {
 
         void resetLocalMap() override;
         void flushGpuRays();  // trace the rays queued in gpu_->rays()
+        void clearMemoryOutOfMap(const std::vector<int> &clear_id, const int &i) override;
     };
 }

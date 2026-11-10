@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include "rog_map/cuda/raycast_backend.h"
 #include <rog_map/rog_map_core/config.hpp>
 #include <super_utils/scope_timer.hpp>
 
@@ -66,6 +67,21 @@ namespace rog_map {
 
         bool insideLocalMap(const Vec3i &id_g) const;
 
+        /// [px4_oa] This map's grid for the CUDA backend.
+        cuda::Geometry gpuGeometry() const {
+            cuda::Geometry g;
+            g.resolution = sc_.resolution;
+            g.resolution_inv = sc_.resolution_inv;
+            for (int a = 0; a < 3; ++a) {
+                g.map_size[a] = sc_.map_size_i(a);
+                g.half_map_size[a] = sc_.half_map_size_i(a);
+                g.origin[a] = local_map_origin_i_(a);
+            }
+            return g;
+        }
+
+        size_t cellCount() const { return static_cast<size_t>(sc_.map_size_i.prod()); }
+
     protected:
         struct SlidingConfig {
             double resolution{0};
@@ -97,7 +113,9 @@ namespace rog_map {
 
         virtual void resetCell(const int & hash_id) = 0;
 
-        void clearMemoryOutOfMap(const vector<int> &clear_id, const int &i);
+        // [px4_oa] virtual: ProbMap clears the slabs on the GPU when that backend is on
+
+        virtual void clearMemoryOutOfMap(const vector<int> &clear_id, const int &i);
 
 
         int getLocalIndexHash(const Vec3i &id_in) const;

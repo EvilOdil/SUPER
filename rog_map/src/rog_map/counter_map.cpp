@@ -151,6 +151,24 @@ namespace rog_map {
         }
     }
 
+    void CounterMap::applyCounterDeltas(const cuda::CounterDelta *deltas, const size_t n) {
+        if (n > 0) {
+            map_empty_ = false;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const int addr = static_cast<int>(deltas[i].cell);
+            const GridType from_type = getGridType(addr);
+            md_.occupied_cnt[addr] += deltas[i].occupied;
+            md_.unknown_cnt[addr] += deltas[i].unknown;
+            const GridType to_type = getGridType(addr);
+            if (from_type != to_type) {
+                Vec3i id_g;
+                hashIdToGlobalIndex(addr, id_g);
+                triggerJumpingEdge(id_g, from_type, to_type);
+            }
+        }
+    }
+
     bool CounterMap::isUnknown(const Vec3i &id_g) const {
         return isUnknown(getHashIndexFromGlobalIndex(id_g));
     }

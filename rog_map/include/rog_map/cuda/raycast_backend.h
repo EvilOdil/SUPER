@@ -14,8 +14,9 @@
 namespace rog_map {
 namespace cuda {
 
-struct Geometry {      // the sliding map, in cells
+struct Geometry {      // a sliding map (SlidingMap), in cells
     double resolution; // [m]
+    double resolution_inv;
     int map_size[3];
     int half_map_size[3];
     int origin[3];     // local map origin, global cell index
@@ -32,18 +33,19 @@ struct Ray {           // prepared on the CPU exactly as ProbMap::raycastProcess
     int pad;
 };
 
-// Cell types in a Transition (not rog_map::GridType: no dependency on its values).
-enum : uint32_t { kUnknown = 0, kKnownFree = 1, kOccupied = 2 };
-
-// A cell whose type changed: cell index in the low 26 bits, then 2 bits from, 2 bits to.
-inline uint32_t transitionCell(const uint32_t t) { return t & 0x03ffffffu; }
-inline uint32_t transitionFrom(const uint32_t t) { return (t >> 26) & 3u; }
-inline uint32_t transitionTo(const uint32_t t) { return (t >> 28) & 3u; }
+// What one update changed in a cell of the counter (inflation) map: how many of its sub-cells
+// became / stopped being occupied and unknown, summed on the GPU.
+struct CounterDelta {
+    uint32_t cell;     // hash index in the counter map
+    int16_t occupied;
+    int16_t unknown;
+};
 
 class RaycastBackend {
 public:
-    // nullptr (and why) if there is no usable GPU or the map is too large for the cell packing.
-    static std::unique_ptr<RaycastBackend> create(size_t cells, std::string &why_not);
+    // cells: of the probability map; counter_cells: of the counter (inflation) map.
+    // nullptr (and why) if there is no usable GPU.
+    static std::unique_ptr<RaycastBackend> create(size_t cells, size_t counter_cells, std::string &why_not);
 
     virtual ~RaycastBackend() = default;
 
@@ -54,10 +56,20 @@ public:
     // Kernel 1: count touches and hits of rays()[0, n) into the per-cell counters.
     virtual void trace(int n, const Geometry &g) = 0;
 
-    // Kernel 2: fold the counters into the map and zero them. Returns the cells that changed
-    // type (valid until the next call) and the number of cells touched since the last apply().
-    virtual void apply(const Thresholds &t, const uint32_t *&transitions, size_t &n_transitions,
-                       size_t &n_touched) = 0;
+    // Kernel 2: fold the counters into the map and zero them. Cells that change type are summed
+    // per counter-map cell (kernel 3 gathers them): `deltas` (valid until the next call) is what
+    // the CPU applies to the counter map. n_touched: cells touched since the last apply().
+    virtual void apply(const Thresholds &t, const Geometry &map, const Geometry &counter_map,
+                       const CounterDelta *&deltas, size_t &n_deltas, size_t &n_touched) = 0;
+
+    // Map sliding (SlidingMap::clearMemoryOutOfMap): reset to unknown every cell whose local index
+    // along `axis` is one of local_ids[0, n) (kernel clearSlabs; n <= kMaxSlabs). Slabs of
+    // different axes may overlap. finishClear() then returns what all the clears since the last
+    // call changed in the counter map, as apply() does.
+    enum { kMaxSlabs = 32 };
+    virtual void clearSlabs(int axis, const int *local_ids, int n, const Thresholds &t, const Geometry &map,
+                            const Geometry &counter_map) = 0;
+    virtual void finishClear(const CounterDelta *&deltas, size_t &n_deltas) = 0;
 
     virtual void clearCounters() = 0;
 };

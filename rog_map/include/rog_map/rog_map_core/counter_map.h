@@ -44,6 +44,11 @@ namespace rog_map {
                                const GridType &from_type,
                                const GridType &to_type);
 
+        /// [px4_oa] The same as updateGridCounter for every sub-cell change, with the changes
+        /// already summed per cell (CUDA backend). The inflation counters only add and subtract,
+        /// so the order and the grouping do not change the result.
+        void applyCounterDeltas(const cuda::CounterDelta *deltas, size_t n);
+
 
     protected:
         bool map_empty_{true};
